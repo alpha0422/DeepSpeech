@@ -2,7 +2,8 @@ import pandas as pd
 import os
 import argparse
 
-KENLM_BIN = '/opt/kenlm/build/bin/'
+#KENLM_BIN = '/opt/kenlm/build/bin/'
+KENLM_BIN = '/home/scratch.wkong_gpu/toolbox/kenlm/build/bin/'
 
 def get_corpus(csv_files):
     '''
@@ -34,7 +35,7 @@ if __name__ == '__main__':
     with open(corpus_name, 'w') as f:
         f.write(corpus)
 
-    command = KENLM_BIN + 'lmplz --text {} --arpa {} --o {}'.format(
+    command = KENLM_BIN + 'lmplz --text {} --arpa {} --o {} --discount_fallback 1'.format(
         corpus_name, arpa_name, args.n)
     print(command)
     os.system(command)

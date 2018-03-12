@@ -31,6 +31,9 @@ from util.text import sparse_tensor_value_to_texts, wer, Alphabet, ndarray_to_te
 from xdg import BaseDirectory as xdg
 import numpy as np
 
+from fp16_utils import float32_variable_storage_getter
+import mem_util
+
 # Importer
 # ========
 
@@ -180,6 +183,9 @@ tf.app.flags.DEFINE_float   ('valid_word_count_weight', 2.50, 'valid word insert
 
 tf.app.flags.DEFINE_string  ('one_shot_infer',       '',       'one-shot inference mode: specify a wav file and the script will load the checkpoint and perform inference on it. Disables training, testing and exporting.')
 
+# FP16
+tf.app.flags.DEFINE_bool("use_fp16", False, "Train using 16-bit floats instead of 32bit floats")
+
 #for var in ['b1', 'w1', 'b2','w2', 'b3', 'w3', 'a2','h2', 'a3', 'h3', 'b5', 'h5', 'b6', 'h6']:
 #    tf.app.flags.DEFINE_float('%s_stddev' % var, None, 'standard deviation to use when initialising %s' % var)
 
@@ -244,6 +250,7 @@ def initialize_globals():
     # Standard session configuration that'll be used for all new sessions.
     global session_config
     session_config = tf.ConfigProto(allow_soft_placement=True, log_device_placement=FLAGS.log_placement)
+    #session_config.gpu_options.allow_growth=True
 
     global alphabet
     alphabet = Alphabet(os.path.abspath(FLAGS.alphabet_config_path))
@@ -397,7 +404,9 @@ def variable_on_worker_level(name, shape, initializer, trainable=True, regulariz
     with tf.device(device):
         # Create or get apropos variable
         var = tf.get_variable(name=name, shape=shape, initializer=initializer, trainable=trainable,
-                              regularizer=regularizer)
+                              regularizer=regularizer,
+                              dtype=tf.float16 if FLAGS.use_fp16 else tf.float32,
+                              custom_getter=float32_variable_storage_getter)
     return var
 
 # =========================================================
@@ -422,7 +431,7 @@ def variable_on_worker_level(name, shape, initializer, trainable=True, regulariz
                     initializer=tf.ones_initializer,
                     trainable=False,
                     regularizer= None)
-    batch_mean, batch_var = tf.nn.moments(input, [0, 1, 2])    
+    batch_mean, batch_var = tf.nn.moments(input, [0, 1, 2])
     if (training):
         batch_mean, batch_var = tf.nn.moments(input, [0, 1, 2])
         g_mean = g_mean * bn_momentum + batch_mean * (1.0 - bn_momentum)
@@ -479,7 +488,7 @@ def conv2D(name,
     '''
     b = variable_on_worker_level(name+'/b',
                    shape=[output_channels],
-                   initializer=bias_initializer, 
+                   initializer=bias_initializer,
                    trainable=True, regularizer= None)
     y = tf.nn.bias_add(y, b)
     '''
@@ -537,150 +546,164 @@ def DeepSpeech2(batch_x, seq_length,training):
     DeepSpeech2-like model https://arxiv.org/pdf/1512.02595.pdf
     '''
 
-    dropout_keep_prob = FLAGS.dropout if training else 1.0
+    #with tf.variable_scope("", reuse=None, initializer=tf.contrib.layers.xavier_initializer(uniform=False)) as scope:
+    with tf.variable_scope("", reuse=None, initializer=tf.contrib.layers.xavier_initializer(uniform=False),
+        custom_getter=float32_variable_storage_getter) as scope:
 
-    # Input shape: [B, T, F]
-    batch_x_shape = tf.shape(batch_x)
-    batch_size = batch_x_shape[0]
-    T = batch_x_shape[1]
-    F = batch_x_shape[2]
-    print("ds2 inputs:", batch_x.get_shape().as_list())
-    # Reshaping `batch_x` to a tensor with shape [B, T, F, 1]
-    batch_4d = tf.expand_dims(batch_x, dim=-1)
-    # print(batch_4d.get_shape()
+        if FLAGS.use_fp16:
+            batch_x = tf.cast(batch_x, tf.float16)
 
-    #----- Convolutional layers -----------------------------------------------
-    '''
-    conv_layers = [
-        {'kernel_size': [11,41], 'stride': [2,2], 'num_channels': 32, 'padding': 'SAME' },
-        {'kernel_size': [11,21], 'stride': [2,2], 'num_channels': 64, 'padding': 'SAME' },
-        {'kernel_size': [11,21], 'stride': [2,2], 'num_channels': 96, 'padding': 'SAME'}
-    ]
-    
-    conv_layers = [
-        {'kernel_size': [3,3], 'stride': [1,1], 'num_channels':  32, 'padding': 'SAME'},
-        {'kernel_size': [3,3], 'stride': [2,2], 'num_channels':  48, 'padding': 'SAME' },
-        {'kernel_size': [3,3], 'stride': [1,1], 'num_channels':  64, 'padding': 'SAME'},
-        {'kernel_size': [3,3], 'stride': [2,2], 'num_channels':  80, 'padding': 'SAME' },
-        {'kernel_size': [3,3], 'stride': [1,1], 'num_channels':  96, 'padding': 'SAME' },
-        {'kernel_size': [3,3], 'stride': [2,2], 'num_channels': 128, 'padding': 'SAME'}
-    ]
-    '''
+        dropout_keep_prob = FLAGS.dropout if training else 1.0
 
-    # Number of convolutional layers
-    N_conv = min(len(conv_layers), num_conv_layers)
+        # Input shape: [B, T, F]
+        batch_x_shape = tf.shape(batch_x)
+        batch_size = batch_x_shape[0]
+        T = batch_x_shape[1]
+        F = batch_x_shape[2]
+        print("ds2 inputs:", batch_x.get_shape().as_list())
+        # Reshaping `batch_x` to a tensor with shape [B, T, F, 1]
+        batch_4d = tf.expand_dims(batch_x, dim=-1)
+        print("batch_4d", tf.shape(batch_4d))
 
-    ch_out = batch_4d.get_shape()[-1]
-    f_out = n_input
-    conv = batch_4d
-    for idx_conv in range(N_conv):
-        name = 'conv{}'.format(idx_conv+1)
-        ch_in = ch_out
-        ch_out = conv_layers[idx_conv]['num_channels']
-        kernel_size = conv_layers[idx_conv]['kernel_size']  #[time, freq]
-        strides = conv_layers[idx_conv]['stride']
+        #----- Convolutional layers -----------------------------------------------
+        '''
+        conv_layers = [
+            {'kernel_size': [11,41], 'stride': [2,2], 'num_channels': 32, 'padding': 'SAME' },
+            {'kernel_size': [11,21], 'stride': [2,2], 'num_channels': 64, 'padding': 'SAME' },
+            {'kernel_size': [11,21], 'stride': [2,2], 'num_channels': 96, 'padding': 'SAME'}
+        ]
 
-        if conv_layers[idx_conv]['padding']== "VALID":
-            seq_length = (seq_length - kernel_size[0] + strides[0]) // strides[0]
-            f_out = (f_out - kernel_size[1]+strides[1]) // strides[1]
-        else:
-            seq_length = (seq_length + strides[0] - 1) // strides[0]
-            f_out = (f_out + strides[1] -  1) // strides[1]
-        print('{}: kernel={} stride={} ch=[{}, {}] f_out={}'.format(
-            name, kernel_size, strides, ch_in, ch_out, f_out))
+        conv_layers = [
+            {'kernel_size': [3,3], 'stride': [1,1], 'num_channels':  32, 'padding': 'SAME'},
+            {'kernel_size': [3,3], 'stride': [2,2], 'num_channels':  48, 'padding': 'SAME' },
+            {'kernel_size': [3,3], 'stride': [1,1], 'num_channels':  64, 'padding': 'SAME'},
+            {'kernel_size': [3,3], 'stride': [2,2], 'num_channels':  80, 'padding': 'SAME' },
+            {'kernel_size': [3,3], 'stride': [1,1], 'num_channels':  96, 'padding': 'SAME' },
+            {'kernel_size': [3,3], 'stride': [2,2], 'num_channels': 128, 'padding': 'SAME'}
+        ]
+        '''
 
-        conv = conv2D(name, input=conv, in_channels=ch_in, output_channels=ch_out,
-                   kernel_size=kernel_size, strides=strides,
-                   padding=conv_layers[idx_conv]['padding'],
-                   # activation_fn=tf.nn.relu,
-                   weights_initializer=tf.contrib.layers.xavier_initializer(uniform=False),
-                   bias_initializer=tf.constant_initializer(0.000001),
-                   training=training)
-    
-    # reshape: [B, T, F, C] --> [B, T, FxC]
-    B = batch_x_shape[0]
-    T = conv.get_shape().as_list()[1]
-    F = conv.get_shape().as_list()[2]
-    C = conv.get_shape().as_list()[3]
-    fc = F*C
-    outputs = tf.reshape(conv, [B, -1, fc])
+        # Number of convolutional layers
+        N_conv = min(len(conv_layers), num_conv_layers)
 
-    # ----- RNN ---------------------------------------------------------------
-    if (num_rnn_layers > 0):
-        rnn_input = outputs
-        rnn_cell_dim = int(FLAGS.rnn_cell_dim)
-        if rnn_unidirectional:
-            print("Uni-directional RNN: num_layers={}, type={}, dim={}".format(num_rnn_layers,
-                                                                         FLAGS.rnn_type,rnn_cell_dim))
-            multirnn_cell_fw = tf.contrib.rnn.MultiRNNCell(
-                [rnn_cell(rnn_cell_dim=rnn_cell_dim, layer_type=FLAGS.rnn_type, dropout_keep_prob=dropout_keep_prob)
-                 for _ in    range(num_rnn_layers)])
+        ch_out = batch_4d.get_shape()[-1]
+        f_out = n_input
+        conv = batch_4d
+        for idx_conv in range(N_conv):
+            name = 'conv{}'.format(idx_conv+1)
+            ch_in = ch_out
+            ch_out = conv_layers[idx_conv]['num_channels']
+            kernel_size = conv_layers[idx_conv]['kernel_size']  #[time, freq]
+            strides = conv_layers[idx_conv]['stride']
 
-            outputs, output_states = tf.nn.dynamic_rnn(cell=multirnn_cell_fw,
-                                                       inputs=rnn_input,
-                                                       sequence_length=seq_length,
-                                                       dtype=tf.float32,
-                                                       time_major=False
-                                                       )
-        else:
-            print("Bi-directional RNN: num_layers={}, type={}, dim={}".format(num_rnn_layers,
-                                                                        FLAGS.rnn_type,rnn_cell_dim))
-            multirnn_cell_fw = tf.contrib.rnn.MultiRNNCell(
-                [rnn_cell(rnn_cell_dim=rnn_cell_dim, layer_type=FLAGS.rnn_type, dropout_keep_prob=dropout_keep_prob)
-                 for _ in range(num_rnn_layers)])
-            multirnn_cell_bw = tf.contrib.rnn.MultiRNNCell(
-                [rnn_cell(rnn_cell_dim=rnn_cell_dim, layer_type=FLAGS.rnn_type, dropout_keep_prob=dropout_keep_prob)
-                 for _ in range(num_rnn_layers)])
+            if conv_layers[idx_conv]['padding']== "VALID":
+                seq_length = (seq_length - kernel_size[0] + strides[0]) // strides[0]
+                f_out = (f_out - kernel_size[1]+strides[1]) // strides[1]
+            else:
+                seq_length = (seq_length + strides[0] - 1) // strides[0]
+                f_out = (f_out + strides[1] -  1) // strides[1]
+            print('{}: kernel={} stride={} ch=[{}, {}] f_out={}'.format(
+                name, kernel_size, strides, ch_in, ch_out, f_out))
 
-            outputs,output_states = tf.nn.bidirectional_dynamic_rnn(cell_fw=multirnn_cell_fw, cell_bw= multirnn_cell_bw,
-                                                        inputs=rnn_input,
-                                                        sequence_length=seq_length,
-                                                        dtype=tf.float32,
-                                                        time_major=False
-                                                        )
-            # reshape: 2 x [B, T, n_cell_dim] --> [B, T, 2*n_cell_dim]
-            outputs = tf.concat(outputs, 2)
-
-    #----Row-conv----------------------------------------------------------
-    if (FLAGS.row_conv and FLAGS.row_conv_width > 1):
-        print("Row convolution width={}".format(FLAGS.row_conv_width))
-        C = outputs.get_shape().as_list()[-1]
-        outputs = row_conv(name="row_conv", input=outputs,
-                       batch=batch_x_shape[0], channels=C, width=FLAGS.row_conv_width,
+            conv = conv2D(name, input=conv, in_channels=ch_in, output_channels=ch_out,
+                       kernel_size=kernel_size, strides=strides,
+                       padding=conv_layers[idx_conv]['padding'],
+                       # activation_fn=tf.nn.relu,
+                       weights_initializer=tf.contrib.layers.xavier_initializer(uniform=False),
+                       bias_initializer=tf.constant_initializer(0.000001),
                        training=training)
 
-    #---- reshape: [B, T, C] --> [T, B, C] --------------------------------
-    outputs =  tf.transpose(outputs, [1, 0, 2])
+        # reshape: [B, T, F, C] --> [B, T, FxC]
+        B = batch_x_shape[0]
+        T = conv.get_shape().as_list()[1]
+        F = conv.get_shape().as_list()[2]
+        C = conv.get_shape().as_list()[3]
+        fc = F*C
+        outputs = tf.reshape(conv, [B, -1, fc])
 
-    #--- hidden layer with clipped RELU activation and dropout-------------
-    n_hidden_in = outputs.get_shape().as_list()[-1]
-    outputs = tf.reshape(outputs, [-1, n_hidden_in])
-    # fc1=[h5,b5]
-    fc1_w = variable_on_worker_level('fc1/w', [n_hidden_in, n_hidden],
-                   tf.contrib.layers.xavier_initializer(uniform=True),
-                   trainable=True,
-                   regularizer=tf.contrib.layers.l2_regularizer(weight_decay) if (weight_decay > 0.) else None)
-    fc1_b = variable_on_worker_level('fc1/b', [n_hidden],
-                   tf.constant_initializer(0.),
-                   trainable=True, regularizer= None)
-    outputs = tf.minimum(tf.nn.relu(tf.add(tf.matmul(outputs, fc1_w), fc1_b)), FLAGS.relu_clip)
-    outputs = tf.nn.dropout(outputs, dropout_keep_prob)
+        # ----- RNN ---------------------------------------------------------------
+        if (num_rnn_layers > 0):
+            rnn_input = outputs
+            rnn_cell_dim = int(FLAGS.rnn_cell_dim)
+            print(rnn_input.shape)
+            if rnn_unidirectional:
+                print("Uni-directional RNN: num_layers={}, type={}, dim={}".format(num_rnn_layers,
+                                                                             FLAGS.rnn_type,rnn_cell_dim))
 
-    #--- logits --------------------------------------------------
-    #n_hidden = outputs.get_shape().as_list()[-1]
-    fc2_w = variable_on_worker_level('fc2/w', [n_hidden, n_character],
-                   tf.contrib.layers.xavier_initializer(uniform=True),
-                   trainable=True,
-                   regularizer=tf.contrib.layers.l2_regularizer(weight_decay) if (weight_decay > 0.) else None)
-    fc2_b = variable_on_worker_level('fc2/b', [n_character],
-                   tf.constant_initializer(0.),
-                   trainable=True, regularizer= None)
-    outputs = tf.add(tf.matmul(outputs, fc2_w), fc2_b)
-    #--- reshape: [T*B,A] --> [T, B, A] ---------------------------
-    # output format: [n_steps, batch_size, n_character]
-    logits = tf.reshape(outputs, [-1, batch_x_shape[0], n_character], name="logits")
+                #scope.reuse_variables()
+                multirnn_cell_fw = tf.contrib.rnn.MultiRNNCell(
+                    [rnn_cell(rnn_cell_dim=rnn_cell_dim, layer_type=FLAGS.rnn_type, dropout_keep_prob=dropout_keep_prob)
+                     for _ in    range(num_rnn_layers)])
 
-    return logits, seq_length
+                outputs, output_states = tf.nn.dynamic_rnn(cell=multirnn_cell_fw,
+                                                           inputs=rnn_input,
+                                                           sequence_length=seq_length,
+                                                           dtype=tf.float16 if FLAGS.use_fp16 else tf.float32,
+                                                           time_major=False
+                                                           )
+            else:
+                print("Bi-directional RNN: num_layers={}, type={}, dim={}".format(num_rnn_layers,
+                                                                            FLAGS.rnn_type,rnn_cell_dim))
+                multirnn_cell_fw = tf.contrib.rnn.MultiRNNCell(
+                    [rnn_cell(rnn_cell_dim=rnn_cell_dim, layer_type=FLAGS.rnn_type, dropout_keep_prob=dropout_keep_prob)
+                     for _ in range(num_rnn_layers)])
+                multirnn_cell_bw = tf.contrib.rnn.MultiRNNCell(
+                    [rnn_cell(rnn_cell_dim=rnn_cell_dim, layer_type=FLAGS.rnn_type, dropout_keep_prob=dropout_keep_prob)
+                     for _ in range(num_rnn_layers)])
+
+                outputs,output_states = tf.nn.bidirectional_dynamic_rnn(cell_fw=multirnn_cell_fw, cell_bw= multirnn_cell_bw,
+                                                            inputs=rnn_input,
+                                                            sequence_length=seq_length,
+                                                            dtype=tf.float16 if FLAGS.use_fp16 else tf.float32,
+                                                            time_major=False
+                                                            )
+                # reshape: 2 x [B, T, n_cell_dim] --> [B, T, 2*n_cell_dim]
+                outputs = tf.concat(outputs, 2)
+
+        #----Row-conv----------------------------------------------------------
+        if (FLAGS.row_conv and FLAGS.row_conv_width > 1):
+            print("Row convolution width={}".format(FLAGS.row_conv_width))
+            C = outputs.get_shape().as_list()[-1]
+            outputs = row_conv(name="row_conv", input=outputs,
+                           batch=batch_x_shape[0], channels=C, width=FLAGS.row_conv_width,
+                           training=training)
+
+        #---- reshape: [B, T, C] --> [T, B, C] --------------------------------
+        outputs =  tf.transpose(outputs, [1, 0, 2])
+
+        #--- hidden layer with clipped RELU activation and dropout-------------
+        n_hidden_in = outputs.get_shape().as_list()[-1]
+        outputs = tf.reshape(outputs, [-1, n_hidden_in])
+        # fc1=[h5,b5]
+        fc1_w = variable_on_worker_level('fc1/w', [n_hidden_in, n_hidden],
+                       tf.contrib.layers.xavier_initializer(uniform=True),
+                       trainable=True,
+                       regularizer=tf.contrib.layers.l2_regularizer(weight_decay) if (weight_decay > 0.) else None)
+        fc1_b = variable_on_worker_level('fc1/b', [n_hidden],
+                       tf.constant_initializer(0.),
+                       trainable=True, regularizer= None)
+        outputs = tf.minimum(tf.nn.relu(tf.add(tf.matmul(outputs, fc1_w), fc1_b)), FLAGS.relu_clip)
+        outputs = tf.nn.dropout(outputs, dropout_keep_prob)
+
+        #--- logits --------------------------------------------------
+        #n_hidden = outputs.get_shape().as_list()[-1]
+        fc2_w = variable_on_worker_level('fc2/w', [n_hidden, n_character],
+                       tf.contrib.layers.xavier_initializer(uniform=True),
+                       trainable=True,
+                       regularizer=tf.contrib.layers.l2_regularizer(weight_decay) if (weight_decay > 0.) else None)
+        fc2_b = variable_on_worker_level('fc2/b', [n_character],
+                       tf.constant_initializer(0.),
+                       trainable=True, regularizer= None)
+        outputs = tf.add(tf.matmul(outputs, fc2_w), fc2_b)
+        #--- reshape: [T*B,A] --> [T, B, A] ---------------------------
+        # output format: [n_steps, batch_size, n_character]
+        logits = tf.reshape(outputs, [-1, batch_x_shape[0], n_character], name="logits")
+
+        # Convert logits to fp32 for softmax
+        if FLAGS.use_fp16:
+            logits = tf.cast(logits, tf.float32)
+
+        return logits, seq_length
 #================================================================================
 
 if not os.path.exists(os.path.abspath(FLAGS.decoder_library_path)):
@@ -756,7 +779,7 @@ def calculate_mean_edit_distance_and_loss(model_feeder, tower, training):
     # - the recognition mean edit distance,
     # - the decoded batch and
     # - the original batch_y (which contains the verified transcriptions).
-    return total_loss, avg_loss, distance, mean_edit_distance, decoded, batch_y
+    return total_loss, avg_loss, distance, mean_edit_distance, decoded, batch_y, batch_seq_len
 
 
 # =======Optimization==========================================================
@@ -844,7 +867,7 @@ def get_tower_results(model_feeder, optimizer):
                 with tf.name_scope('tower_%d' % i) as scope:
                     # Calculate the avg_loss and mean_edit_distance and retrieve the decoded
                     # batch along with the original batch's labels (Y) of this tower
-                    total_loss, avg_loss, distance, mean_edit_distance, decoded, labels = \
+                    total_loss, avg_loss, distance, mean_edit_distance, decoded, labels, batch_seq_len = \
                         calculate_mean_edit_distance_and_loss(model_feeder, i, training = (optimizer is None))
 
                     # Allow for variables to be re-used by the next tower
@@ -881,7 +904,8 @@ def get_tower_results(model_feeder, optimizer):
     return (tower_labels, tower_decodings, tower_distances, tower_total_losses), \
            tower_gradients, \
            tf.reduce_mean(tower_mean_edit_distances, 0), \
-           tf.reduce_mean(tower_avg_losses, 0)
+           tf.reduce_mean(tower_avg_losses, 0), \
+           batch_seq_len
 
 
 def average_gradients(tower_gradients):
@@ -1740,7 +1764,7 @@ def train(server=None):
                                                    total_num_replicas=FLAGS.replicas)
 
     # Get the data_set specific graph end-points
-    results_tuple, gradients, mean_edit_distance, loss = get_tower_results(model_feeder, optimizer)
+    results_tuple, gradients, mean_edit_distance, loss, batch_seq_len = get_tower_results(model_feeder, optimizer)
 
     # Average tower gradients across GPUs
     avg_tower_gradients = average_gradients(gradients)
@@ -1804,8 +1828,8 @@ def train(server=None):
         with tf.train.MonitoredTrainingSession(master='' if server is None else server.target,
                                                is_chief=is_chief,
                                                hooks=hooks,
-                                               checkpoint_dir=FLAGS.checkpoint_dir,
-                                               save_checkpoint_secs=FLAGS.checkpoint_secs if FLAGS.train else None,
+                                               #checkpoint_dir=FLAGS.checkpoint_dir,
+                                               #save_checkpoint_secs=FLAGS.checkpoint_secs if FLAGS.train else None,
                                                config=session_config) as session:
             try:
                 if is_chief:
@@ -1856,16 +1880,29 @@ def train(server=None):
                         log_debug('Starting batch...')
                         # Compute the batch
                         batch_time = time.time()
+                        #run_metadata = tf.RunMetadata()
+                        #writer = tf.summary.FileWriter('logs', session.graph)
 #                        _, current_step, batch_loss, batch_report = session.run([train_op, global_step, loss, report_params], **extra_params)
-                        _, current_step, batch_loss, learn_rate, batch_report = session.run([train_op,
-                                                                global_step, loss, lr, report_params], **extra_params)
+                        _, current_step, batch_loss, learn_rate, batch_report, seq_length = session.run([train_op,
+                                                                global_step, loss, lr, report_params, batch_seq_len],
+                                                                #options=tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE, output_partition_graphs=True),
+                                                                #run_metadata=run_metadata,
+                                                                options=tf.RunOptions(report_tensor_allocations_upon_oom=True),
+                                                                **extra_params)
 
+                        #mem_util.print_memory_timeline(run_metadata)
+                        #writer.close()
+                        #with open("run.txt", "w") as out:
+                        #    out.write(str(run_metadata))
+                        #print(batch_seq_len.eval(session=session))
+                        #print('Sequence length: ', seq_length[0])
 
                         batch_time = time.time() - batch_time
                         session_time += batch_time
                         # Uncomment the next line for debugging race conditions / distributed TF
                         log_debug('Finished batch step %d %f' %(current_step, batch_loss))
-                        if ((current_step % 100) == 0):
+                        #if ((current_step % 100) == 0):
+                        if ((current_step % 1) == 0):
                             log_info('time: %s, step: %d, loss: %f lr: %f' %
                                       (format_duration(session_time), current_step, batch_loss, learn_rate)
                                      )
@@ -2053,6 +2090,7 @@ def main(_) :
                 with tf.Session(server.target) as session:
                     for worker in FLAGS.worker_hosts:
                         log_debug('Waiting for stop token...')
+                        run_metadata = tf.RunMetadata()
                         token = session.run(done_dequeues[FLAGS.task_index])
                         if token < 0:
                             log_debug('Got a kill switch token from worker %i.' % abs(token + 1))
